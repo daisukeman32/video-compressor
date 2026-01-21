@@ -10,6 +10,10 @@ themeToggle.addEventListener('click', () => {
     localStorage.setItem('theme', next);
 });
 
+// FFmpeg
+const { createFFmpeg, fetchFile } = FFmpeg;
+let ffmpeg = null;
+
 // DOM
 const dropZone = document.getElementById('dropZone');
 const fileInput = document.getElementById('fileInput');
@@ -30,11 +34,38 @@ const compressedSizeEl = document.getElementById('compressedSize');
 const reductionEl = document.getElementById('reduction');
 const downloadBtn = document.getElementById('downloadBtn');
 const errorEl = document.getElementById('error');
+const loadingOverlay = document.getElementById('loadingOverlay');
+const loadingText = document.getElementById('loadingText');
 
 // State
 let selectedFile = null;
 let selectedQuality = 'medium';
-let downloadUrl = null;
+let compressedBlob = null;
+
+// Initialize FFmpeg
+async function initFFmpeg() {
+    loadingOverlay.classList.add('show');
+    loadingText.textContent = 'Loading FFmpeg...';
+
+    ffmpeg = createFFmpeg({
+        log: true,
+        progress: ({ ratio }) => {
+            const percent = Math.round(ratio * 100);
+            progressFill.style.width = `${percent}%`;
+            progressText.textContent = `Compressing... ${percent}%`;
+        }
+    });
+
+    try {
+        await ffmpeg.load();
+        console.log('FFmpeg loaded successfully');
+    } catch (error) {
+        console.error('Failed to load FFmpeg:', error);
+        showError('Failed to load FFmpeg. Please reload the page.');
+    } finally {
+        loadingOverlay.classList.remove('show');
+    }
+}
 
 // Format file size
 function formatSize(bytes) {
@@ -124,90 +155,89 @@ qualityOptions.forEach(opt => {
 
 // Compress
 compressBtn.addEventListener('click', async () => {
-    if (!selectedFile) return;
+    if (!selectedFile || !ffmpeg) return;
 
     hideError();
     compressBtn.disabled = true;
     progressContainer.classList.add('show');
     progressFill.style.width = '0%';
-    progressText.textContent = 'Uploading...';
+    progressText.textContent = 'Loading file...';
     result.classList.remove('show');
 
-    const formData = new FormData();
-    formData.append('video', selectedFile);
-    formData.append('quality', selectedQuality);
+    // CRF values (lower = higher quality)
+    const crfValues = {
+        high: 23,
+        medium: 28,
+        low: 35
+    };
+    const crf = crfValues[selectedQuality];
 
     try {
-        const xhr = new XMLHttpRequest();
+        // Get file extension
+        const ext = selectedFile.name.split('.').pop().toLowerCase();
+        const inputName = `input.${ext}`;
+        const outputName = 'output.mp4';
 
-        xhr.upload.addEventListener('progress', (e) => {
-            if (e.lengthComputable) {
-                const pct = Math.round((e.loaded / e.total) * 50);
-                progressFill.style.width = pct + '%';
-                progressText.textContent = `Uploading... ${pct * 2}%`;
-            }
-        });
+        // Write file to FFmpeg
+        ffmpeg.FS('writeFile', inputName, await fetchFile(selectedFile));
 
-        xhr.addEventListener('load', () => {
-            if (xhr.status === 200) {
-                const data = JSON.parse(xhr.responseText);
-                if (data.success) {
-                    downloadUrl = data.downloadUrl;
+        // Run compression
+        progressText.textContent = 'Compressing...';
+        await ffmpeg.run(
+            '-i', inputName,
+            '-c:v', 'libx264',
+            '-crf', crf.toString(),
+            '-preset', 'medium',
+            '-c:a', 'aac',
+            '-b:a', '128k',
+            '-movflags', '+faststart',
+            '-y',
+            outputName
+        );
 
-                    originalSizeEl.textContent = formatSize(data.originalSize);
-                    compressedSizeEl.textContent = formatSize(data.compressedSize);
-                    const reduction = ((1 - data.compressedSize / data.originalSize) * 100).toFixed(1);
-                    reductionEl.textContent = reduction + '%';
+        // Read output file
+        progressText.textContent = 'Preparing download...';
+        const data = ffmpeg.FS('readFile', outputName);
+        compressedBlob = new Blob([data.buffer], { type: 'video/mp4' });
 
-                    progressContainer.classList.remove('show');
-                    result.classList.add('show');
-                } else {
-                    showError(data.error || 'Compression failed');
-                    progressContainer.classList.remove('show');
-                }
-            } else {
-                showError('Server error');
-                progressContainer.classList.remove('show');
-            }
-            compressBtn.disabled = false;
-        });
+        // Show results
+        const originalSize = selectedFile.size;
+        const compressedSize = compressedBlob.size;
+        const reduction = ((1 - compressedSize / originalSize) * 100).toFixed(1);
 
-        xhr.addEventListener('error', () => {
-            showError('Network error');
-            progressContainer.classList.remove('show');
-            compressBtn.disabled = false;
-        });
+        originalSizeEl.textContent = formatSize(originalSize);
+        compressedSizeEl.textContent = formatSize(compressedSize);
+        reductionEl.textContent = reduction + '%';
 
-        // Simulate compression progress after upload
-        xhr.addEventListener('loadend', () => {
-            if (xhr.status === 200 && !JSON.parse(xhr.responseText).success) return;
-        });
-
-        xhr.open('POST', '/compress');
-        xhr.send(formData);
-
-        // Animate progress during server processing
-        let progress = 50;
-        const interval = setInterval(() => {
-            if (progress < 95) {
-                progress += Math.random() * 3;
-                progressFill.style.width = progress + '%';
-                progressText.textContent = 'Compressing...';
-            }
-        }, 500);
-
-        xhr.addEventListener('loadend', () => clearInterval(interval));
-
-    } catch (err) {
-        showError('Error: ' + err.message);
         progressContainer.classList.remove('show');
+        result.classList.add('show');
+
+        // Cleanup
+        ffmpeg.FS('unlink', inputName);
+        ffmpeg.FS('unlink', outputName);
+
+    } catch (error) {
+        console.error('Compression error:', error);
+        showError('Compression error: ' + error.message);
+        progressContainer.classList.remove('show');
+    } finally {
         compressBtn.disabled = false;
     }
 });
 
 // Download
 downloadBtn.addEventListener('click', () => {
-    if (downloadUrl) {
-        window.location.href = downloadUrl;
-    }
+    if (!compressedBlob) return;
+
+    const url = URL.createObjectURL(compressedBlob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'compressed_' + (selectedFile?.name || 'video.mp4');
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
 });
+
+// Initialize
+initFFmpeg();
